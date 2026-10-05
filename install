@@ -1,0 +1,103 @@
+#!/bin/sh
+
+# Install mic-monitor for the current user.
+#
+#   ./install            into ~/.local/bin, started now and at every login
+#   ./install --dry-run  print what would happen
+
+set -eu
+
+SRC="$(cd "$(dirname "$0")" && pwd)"
+BIN="$HOME/.local/bin"
+AUTOSTART="${XDG_CONFIG_HOME:-$HOME/.config}/autostart/mic-monitor.desktop"
+STAMP="$(date +%Y%m%d%H%M%S)"
+# How the running copy shows up in ps: env hands the script to python3.
+RUNNING="^python3 $BIN/mic-monitor\$"
+
+DRY=0
+
+for arg in "$@"; do
+    case "$arg" in
+        --dry-run | -n) DRY=1 ;;
+        --help | -h)
+            sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'
+            exit 0
+            ;;
+        *)
+            echo "install: unknown option $arg (try --help)" >&2
+            exit 2
+            ;;
+    esac
+done
+
+say() { printf '%s\n' "$*"; }
+run() {
+    if [ "$DRY" = 1 ]; then
+        printf '  would run: %s\n' "$*"
+    else
+        "$@"
+    fi
+}
+
+backup() {
+    [ -e "$1" ] || return 0
+    cmp -s "$1" "$2" 2>/dev/null && return 0 # Identical
+    say "  backing up $1 -> $1.bak-$STAMP"
+    run cp -p "$1" "$1.bak-$STAMP"
+}
+
+missing=""
+for tool in python3 pw-loopback pw-record pw-play; do
+    command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
+done
+[ -n "$missing" ] && say "WARNING: not found on PATH:$missing"
+
+python3 - <<'PY' 2>/dev/null || say "WARNING: libX11, libXi or libXtst not found!"
+import ctypes.util, sys
+sys.exit(0 if all(ctypes.util.find_library(n) for n in ("X11", "Xi", "Xtst")) else 1)
+PY
+
+say "Installing into $BIN"
+run mkdir -p "$BIN"
+backup "$BIN/mic-monitor" "$SRC/mic-monitor"
+run cp "$SRC/mic-monitor" "$BIN/mic-monitor"
+run chmod +x "$BIN/mic-monitor"
+
+say "Starting it at login: $AUTOSTART"
+if [ "$DRY" = 1 ]; then
+    say "  would write it, running $BIN/mic-monitor"
+else
+    mkdir -p "$(dirname "$AUTOSTART")"
+    cat >"$AUTOSTART" <<EOF
+[Desktop Entry]
+Type=Application
+Name=mic-monitor
+Comment=Hear your own mic on Mouse5
+Exec=$BIN/mic-monitor
+StartupNotify=false
+Terminal=false
+EOF
+fi
+
+say "Starting it now"
+if [ -z "${DISPLAY:-}" ]; then
+    say "  no DISPLAY here; it starts at the next login"
+elif [ "$DRY" = 1 ]; then
+    pgrep -f "$RUNNING" >/dev/null && say "  would restart the running copy" || say "  would start it"
+else
+    pkill -f "$RUNNING" || true
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        pgrep -f "$RUNNING" >/dev/null || break
+        sleep 0.1
+    done
+    setsid -f "$BIN/mic-monitor" >/dev/null 2>&1 </dev/null
+    sleep 0.5
+    if pgrep -f "$RUNNING" >/dev/null; then
+        say "  running"
+    else
+        say "  FAILED to start; run $BIN/mic-monitor to see why"
+    fi
+fi
+
+say ""
+say "All done!"

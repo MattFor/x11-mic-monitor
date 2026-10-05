@@ -1,0 +1,345 @@
+#!/usr/bin/env python3
+
+import ctypes
+import ctypes.util
+import fcntl
+import os
+import select
+import signal
+import subprocess
+import sys
+import time
+
+# The two settings: "hold" or "toggle", and how late you hear yourself in seconds.
+MODE = "hold"
+DELAY = 0.5
+
+BUTTON = 9
+NO_DELAY_BUTTON = 8
+LATENCY_MS = 2
+# What the graph buffers on top of the requested delay.
+DRAIN_SLACK = 0.1
+
+RUNTIME = os.environ.get("XDG_RUNTIME_DIR") or os.path.expanduser("~/.cache")
+RECORDING = os.path.join(RUNTIME, "mic-monitor.wav")
+
+GENERIC_EVENT = 35
+XI_RAW_BUTTON_PRESS = 15
+XI_RAW_BUTTON_RELEASE = 16
+XI_ALL_MASTER_DEVICES = 1
+XI_ANY_MODIFIER = 1 << 31
+XI_GRAB_MODE_ASYNC = 1
+MOD4_MASK = 1 << 6
+PR_SET_PDEATHSIG = 1
+
+Display, Window = ctypes.c_void_p, ctypes.c_ulong
+
+
+class XIEventMask(ctypes.Structure):
+	_fields_ = [("deviceid", ctypes.c_int), ("mask_len", ctypes.c_int), ("mask", ctypes.POINTER(ctypes.c_ubyte))]
+
+
+class XIGrabModifiers(ctypes.Structure):
+	_fields_ = [("modifiers", ctypes.c_int), ("status", ctypes.c_int)]
+
+
+class XGenericEventCookie(ctypes.Structure):
+	_fields_ = [
+		("type", ctypes.c_int),
+		("serial", ctypes.c_ulong),
+		("send_event", ctypes.c_int),
+		("display", Display),
+		("extension", ctypes.c_int),
+		("evtype", ctypes.c_int),
+		("cookie", ctypes.c_uint),
+		("data", ctypes.c_void_p),
+	]
+
+
+class XEvent(ctypes.Union):
+	_fields_ = [("xcookie", XGenericEventCookie), ("pad", ctypes.c_long * 24)]
+
+
+# Only the head of XIRawEvent, up to the button number.
+class XIRawEvent(ctypes.Structure):
+	_fields_ = [
+		("type", ctypes.c_int),
+		("serial", ctypes.c_ulong),
+		("send_event", ctypes.c_int),
+		("display", Display),
+		("extension", ctypes.c_int),
+		("evtype", ctypes.c_int),
+		("time", ctypes.c_ulong),
+		("deviceid", ctypes.c_int),
+		("sourceid", ctypes.c_int),
+		("detail", ctypes.c_int),
+	]
+
+
+x11 = ctypes.CDLL(ctypes.util.find_library("X11"))
+x11.XOpenDisplay.restype, x11.XOpenDisplay.argtypes = Display, [ctypes.c_char_p]
+x11.XDefaultRootWindow.restype, x11.XDefaultRootWindow.argtypes = Window, [Display]
+x11.XQueryExtension.argtypes = [
+	Display,
+	ctypes.c_char_p,
+	ctypes.POINTER(ctypes.c_int),
+	ctypes.POINTER(ctypes.c_int),
+	ctypes.POINTER(ctypes.c_int),
+]
+x11.XQueryPointer.argtypes = [
+	Display,
+	Window,
+	ctypes.POINTER(Window),
+	ctypes.POINTER(Window),
+	ctypes.POINTER(ctypes.c_int),
+	ctypes.POINTER(ctypes.c_int),
+	ctypes.POINTER(ctypes.c_int),
+	ctypes.POINTER(ctypes.c_int),
+	ctypes.POINTER(ctypes.c_uint),
+]
+x11.XDisplayKeycodes.argtypes = [Display, ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int)]
+x11.XGetKeyboardMapping.restype = ctypes.POINTER(ctypes.c_ulong)
+x11.XGetKeyboardMapping.argtypes = [Display, ctypes.c_ubyte, ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
+x11.XFree.argtypes = [ctypes.c_void_p]
+x11.XConnectionNumber.argtypes = [Display]
+x11.XPending.argtypes = [Display]
+x11.XFlush.argtypes = [Display]
+x11.XNextEvent.argtypes = [Display, ctypes.POINTER(XEvent)]
+x11.XGetEventData.argtypes = [Display, ctypes.POINTER(XGenericEventCookie)]
+x11.XFreeEventData.argtypes = [Display, ctypes.POINTER(XGenericEventCookie)]
+
+xi = ctypes.CDLL(ctypes.util.find_library("Xi"))
+xi.XIQueryVersion.argtypes = [Display, ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int)]
+xi.XISelectEvents.argtypes = [Display, Window, ctypes.POINTER(XIEventMask), ctypes.c_int]
+xi.XIGrabButton.argtypes = [
+	Display,
+	ctypes.c_int,
+	ctypes.c_int,
+	Window,
+	ctypes.c_ulong,
+	ctypes.c_int,
+	ctypes.c_int,
+	ctypes.c_int,
+	ctypes.POINTER(XIEventMask),
+	ctypes.c_int,
+	ctypes.POINTER(XIGrabModifiers),
+]
+
+xtst = ctypes.CDLL(ctypes.util.find_library("Xtst"))
+xtst.XTestFakeKeyEvent.argtypes = [Display, ctypes.c_uint, ctypes.c_int, ctypes.c_ulong]
+
+libc = ctypes.CDLL(None)
+libc.prctl.argtypes = [ctypes.c_int, ctypes.c_ulong]
+
+
+# The kernel ends the loopback with this process however it goes - logout,
+# kill -9 or Ctrl+C - so a crash can never leave the mic stuck on.
+def die_with_parent():
+	libc.prctl(PR_SET_PDEATHSIG, signal.SIGTERM)
+
+
+def super_held(dpy, root):
+	child, root_x, root_y, win_x, win_y, mask = (
+		Window(),
+		ctypes.c_int(),
+		ctypes.c_int(),
+		ctypes.c_int(),
+		ctypes.c_int(),
+		ctypes.c_uint(),
+	)
+	x11.XQueryPointer(
+		dpy,
+		root,
+		ctypes.byref(Window()),
+		ctypes.byref(child),
+		ctypes.byref(root_x),
+		ctypes.byref(root_y),
+		ctypes.byref(win_x),
+		ctypes.byref(win_y),
+		ctypes.byref(mask),
+	)
+	return bool(mask.value & MOD4_MASK)
+
+
+# A keycode the keymap gives no symbol to.
+def blank_keycode(dpy):
+	low, high = ctypes.c_int(), ctypes.c_int()
+	x11.XDisplayKeycodes(dpy, ctypes.byref(low), ctypes.byref(high))
+	per = ctypes.c_int()
+	syms = x11.XGetKeyboardMapping(dpy, low.value, high.value - low.value + 1, ctypes.byref(per))
+	try:
+		for i in range(high.value - low.value + 1):
+			if not any(syms[i * per.value + j] for j in range(per.value)):
+				return low.value + i
+	finally:
+		x11.XFree(syms)
+	return None
+
+
+def cancel_super_shortcut(dpy, keycode):
+	if keycode is not None:
+		xtst.XTestFakeKeyEvent(dpy, keycode, True, 0)
+		xtst.XTestFakeKeyEvent(dpy, keycode, False, 0)
+		x11.XFlush(dpy)
+
+
+class Recorder:
+	def __init__(self):
+		self.recording = None
+		self.playback = None
+
+	def start(self):
+		self.stop_playback()
+		# stderr: pw-record announces the file name on every start.
+		self.recording = subprocess.Popen(
+			["pw-record", "--channels", "1", RECORDING], stderr=subprocess.DEVNULL, preexec_fn=die_with_parent
+		)
+
+	def play(self):
+		self.recording.terminate()
+		self.recording.wait()
+		self.recording = None
+		self.playback = subprocess.Popen(["pw-play", RECORDING], preexec_fn=die_with_parent)
+
+	def stop_playback(self):
+		if self.playback is not None:
+			self.playback.terminate()
+			self.playback.wait()
+			self.playback = None
+
+
+class Loopback:
+	def __init__(self):
+		self.proc = None
+		self.delay = 0.0
+		self.stop_at = None
+
+	def running(self):
+		return self.proc is not None and self.proc.poll() is None
+
+	# Running and not just playing out the end after being switched off.
+	def listening(self):
+		return self.running() and self.stop_at is None
+
+	def on(self, delay):
+		# Back on before the end has played out: keep the same stream going.
+		if self.running() and self.delay == delay:
+			self.stop_at = None
+			return
+		self.kill()
+		self.delay = delay
+		args = ["pw-loopback", "--name", "mic-monitor"]
+		args += ["--delay", str(delay)] if delay else ["--latency", str(LATENCY_MS)]
+		self.proc = subprocess.Popen(args, preexec_fn=die_with_parent)
+
+	def off(self):
+		if self.listening():
+			self.stop_at = time.monotonic() + (self.delay + DRAIN_SLACK if self.delay else 0)
+
+	def kill(self):
+		if self.proc is not None:
+			self.proc.terminate()
+			self.proc.wait()
+			self.proc = None
+		self.stop_at = None
+
+
+def main():
+	if MODE not in ("hold", "toggle"):
+		sys.exit("mic-monitor: MODE must be hold or toggle")
+
+	# Python would hold Ctrl+C until the next X event; die at once instead.
+	signal.signal(signal.SIGINT, signal.SIG_DFL)
+
+	# A second copy would undo every toggle of the first.
+	lock = open(os.path.join(RUNTIME, "mic-monitor.lock"), "w")
+	try:
+		fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+	except BlockingIOError:
+		sys.exit("mic-monitor: already running")
+
+	dpy = x11.XOpenDisplay(None)
+	if not dpy:
+		sys.exit("mic-monitor: cannot open display")
+
+	opcode, first_event, first_error = ctypes.c_int(), ctypes.c_int(), ctypes.c_int()
+	major, minor = ctypes.c_int(2), ctypes.c_int(2)
+	if (
+		not x11.XQueryExtension(
+			dpy, b"XInputExtension", ctypes.byref(opcode), ctypes.byref(first_event), ctypes.byref(first_error)
+		)
+		or xi.XIQueryVersion(dpy, ctypes.byref(major), ctypes.byref(minor)) != 0
+	):
+		sys.exit("mic-monitor: X server lacks XInput 2.2")
+
+	root = x11.XDefaultRootWindow(dpy)
+	bits = (ctypes.c_ubyte * 3)()
+	for evtype in (XI_RAW_BUTTON_PRESS, XI_RAW_BUTTON_RELEASE):
+		bits[evtype >> 3] |= 1 << (evtype & 7)
+	mask = XIEventMask(XI_ALL_MASTER_DEVICES, len(bits), bits)
+	xi.XISelectEvents(dpy, root, ctypes.byref(mask), 1)
+	any_modifier = XIGrabModifiers(XI_ANY_MODIFIER, 0)
+	xi.XIGrabButton(
+		dpy,
+		XI_ALL_MASTER_DEVICES,
+		BUTTON,
+		root,
+		0,
+		XI_GRAB_MODE_ASYNC,
+		XI_GRAB_MODE_ASYNC,
+		False,
+		ctypes.byref(mask),
+		1,
+		ctypes.byref(any_modifier),
+	)
+	x11.XFlush(dpy)
+
+	keycode = blank_keycode(dpy)
+	loopback = Loopback()
+	recorder = Recorder()
+	held = set()
+	fd = x11.XConnectionNumber(dpy)
+	event = XEvent()
+	cookie = event.xcookie
+	while True:
+		if loopback.stop_at is not None and time.monotonic() >= loopback.stop_at:
+			loopback.kill()
+		if not x11.XPending(dpy):
+			select.select(
+				[fd], [], [], None if loopback.stop_at is None else max(0.0, loopback.stop_at - time.monotonic())
+			)
+			continue
+
+		x11.XNextEvent(dpy, ctypes.byref(event))
+		if (
+			cookie.type != GENERIC_EVENT
+			or cookie.extension != opcode.value
+			or not x11.XGetEventData(dpy, ctypes.byref(cookie))
+		):
+			continue
+		evtype, button = cookie.evtype, ctypes.cast(cookie.data, ctypes.POINTER(XIRawEvent)).contents.detail
+		x11.XFreeEventData(dpy, ctypes.byref(cookie))
+
+		if evtype == XI_RAW_BUTTON_PRESS:
+			held.add(button)
+			if button == BUTTON:
+				recorder.stop_playback()
+				if super_held(dpy, root):
+					cancel_super_shortcut(dpy, keycode)
+					recorder.start()
+				elif MODE == "toggle" and loopback.listening():
+					loopback.off()
+				else:
+					loopback.on(0 if NO_DELAY_BUTTON in held else DELAY)
+			elif button == NO_DELAY_BUTTON and BUTTON in held and loopback.listening() and loopback.delay:
+				loopback.on(0)
+		elif evtype == XI_RAW_BUTTON_RELEASE:
+			held.discard(button)
+			if button == BUTTON and recorder.recording is not None:
+				recorder.play()
+			elif button == BUTTON and MODE == "hold":
+				loopback.off()
+
+
+if __name__ == "__main__":
+	main()
