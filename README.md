@@ -62,5 +62,5 @@ rm -f ~/.local/bin/mic-monitor ~/.config/autostart/mic-monitor.desktop
 
 ## License
 
-MIT [LICENSE](LICENSE)
+MIT [LICENSE](LICENSE)  
 By MattFor
